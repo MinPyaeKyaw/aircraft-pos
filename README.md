@@ -205,6 +205,7 @@ so test messages have somewhere to fly).
 pos-report-pipeline/
 ├── README.md
 ├── build.sh                          # publishes the Lambda bundles CDK uploads
+├── smoke-test.sh                     # end-to-end check against a deployed stack
 ├── docs/
 │   ├── architecture.png              # diagram
 │   └── architecture.py               # script that generates the diagram
@@ -282,6 +283,9 @@ npm install
 npm test
 ```
 
+There is no local emulator for the AWS wiring. `smoke-test.sh` covers that
+against a deployed stack — see below.
+
 ## Deploying
 
 Prerequisites: .NET 8 SDK, Node.js 18+, AWS credentials, and a bootstrapped
@@ -312,16 +316,41 @@ only break on the first invocation.
 ### End-to-end check after deploying
 
 ```bash
-export API_URL="https://xxxx.execute-api.eu-west-1.amazonaws.com/prod"
+./smoke-test.sh
+```
+
+It finds the API URL from the CloudFormation stack, or takes one as an
+argument. Sixteen checks covering the rejections, the worked example, the
+low-fuel warning, and the permanent-failure path — including that an unknown
+destination leaves the DLQ empty. Exits non-zero on any failure, so it works in
+CI.
+
+```
+1. Rejections (400 before anything is stored)
+  PASS  empty body
+  ...
+5. Unknown destination is a permanent failure, not a retry
+  PASS  report still readable as PARSED
+  PASS  DLQ stayed empty
+-------------------------------------------
+passed 16, failed 0
+```
+
+By hand, if you prefer:
+
+```bash
+export API_URL="https://xxxx.execute-api.ap-southeast-1.amazonaws.com/prod"
 
 curl -X POST "$API_URL/pos-reports" -H 'Content-Type: text/plain' \
   --data 'POS/UL204.FR RGN/TO BKK/041205/N1642.3E09612.5/450/12500/2800'
 # -> { "flightId": "UL20420260904RGNBKK", "status": "RECEIVED" }
 
-# note the flight date follows today's year and month, not September 2026
-sleep 5
 curl "$API_URL/status/<flightId from above>"
 ```
+
+Use the `flightId` the POST returns rather than the one above: the flight date
+takes its year and month from when the request arrives, so it follows today's
+date, not September 2026.
 
 ### Tearing down
 
