@@ -1,3 +1,5 @@
+using System.Text.Json;
+using PosReportPipeline.Shared.Models;
 using PosReportPipeline.Shared.Parsing;
 using Xunit;
 
@@ -5,213 +7,233 @@ namespace PosReportPipeline.Tests;
 
 public class PosReportParserTests
 {
-    private const string ValidReport = """
-        POS
-        FLT/ABC123
-        DT/2026-09-05T14:20:00Z
-        PSN/N3722.5 W12205.8
-        ALT/FL350
-        DEST/KLAX
-        """;
+    /// <summary>The example message from the brief.</summary>
+    private const string Example = "POS/UL204.FR RGN/TO BKK/041205/N1642.3E09612.5/450/12500/2800";
+
+    /// <summary>The moment the brief says the API receives it.</summary>
+    private static readonly DateTimeOffset ReceivedAt =
+        new(2026, 9, 4, 15, 12, 30, 123, TimeSpan.Zero);
 
     [Fact]
-    public void Parse_ValidReport_ExtractsEveryField()
+    public void Parse_TheBriefsExample_ProducesEveryFieldTheBriefSpecifies()
     {
-        var report = PosReportParser.Parse(ValidReport);
+        var report = PosReportParser.Parse(Example, ReceivedAt);
 
-        Assert.Equal("ABC123", report.Callsign);
-        Assert.Equal("ABC123-20260905", report.FlightId);
-        Assert.Equal(new DateTimeOffset(2026, 9, 5, 14, 20, 0, TimeSpan.Zero), report.ReportedAtUtc);
-        Assert.Equal(37.375, report.Latitude, 6);
-        Assert.Equal(-122.096667, report.Longitude, 6);
-        Assert.Equal(35000, report.AltitudeFeet);
-        Assert.Equal("KLAX", report.DestinationIcao);
+        Assert.Equal("UL20420260904RGNBKK", report.FlightId);
+        Assert.Equal("UL204", report.FlightNumber);
+        Assert.Equal("RGN", report.Departure);
+        Assert.Equal("BKK", report.Destination);
+        Assert.Equal(new DateTimeOffset(2026, 9, 4, 12, 5, 0, TimeSpan.Zero), report.Timestamp);
+        Assert.Equal(16.705, report.Latitude, 4);
+        Assert.Equal(96.2083, report.Longitude, 4);
+        Assert.Equal(450, report.GroundSpeedKnots);
+        Assert.Equal(12500d, report.FuelOnBoardKg);
+        Assert.Equal(2800d, report.FuelFlowKgPerHour);
     }
 
     [Fact]
-    public void Parse_PassesThroughSourceKey()
+    public void Parse_TheBriefsExample_SerialisesToTheAttachmentJsonInTheBrief()
     {
-        var report = PosReportParser.Parse(ValidReport, "raw/2026/09/05/abc.txt");
-        Assert.Equal("raw/2026/09/05/abc.txt", report.SourceKey);
+        var report = PosReportParser.Parse(Example, ReceivedAt);
+        var json = JsonSerializer.Serialize(report, PosJson.Options);
+
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+
+        Assert.Equal("UL20420260904RGNBKK", root.GetProperty("flightId").GetString());
+        Assert.Equal("UL204", root.GetProperty("flightNumber").GetString());
+        Assert.Equal("RGN", root.GetProperty("departure").GetString());
+        Assert.Equal("BKK", root.GetProperty("destination").GetString());
+
+        // Must be exactly this shape: the same string is the DynamoDB sort key,
+        // so a stray "+00:00" would silently break every lookup.
+        Assert.Equal("2026-09-04T12:05:00Z", root.GetProperty("timestamp").GetString());
+
+        Assert.Equal(16.705, root.GetProperty("latitude").GetDouble(), 4);
+        Assert.Equal(96.2083, root.GetProperty("longitude").GetDouble(), 4);
+        Assert.Equal(450, root.GetProperty("groundSpeedKnots").GetInt32());
+        Assert.Equal(12500d, root.GetProperty("fuelOnBoardKg").GetDouble());
+        Assert.Equal(2800d, root.GetProperty("fuelFlowKgPerHour").GetDouble());
     }
 
-    // N3722.5  => 37 + 22.5/60 = 37.375
-    // E12205.8 => 122 + 5.8/60 = 122.096667
+    // degrees + minutes / 60, negative south and west.
     [Theory]
-    [InlineData("N3722.5 E12205.8", 37.375, 122.096667)]
-    [InlineData("S3722.5 E12205.8", -37.375, 122.096667)]
-    [InlineData("N3722.5 W12205.8", 37.375, -122.096667)]
-    [InlineData("S3722.5 W12205.8", -37.375, -122.096667)]
-    public void Parse_ConvertsAllFourHemispheres(string psn, double expectedLat, double expectedLon)
+    [InlineData("N1642.3E09612.5", 16.705, 96.2083)]
+    [InlineData("S1642.3E09612.5", -16.705, 96.2083)]
+    [InlineData("N1642.3W09612.5", 16.705, -96.2083)]
+    [InlineData("S1642.3W09612.5", -16.705, -96.2083)]
+    [InlineData("N0000.0E00000.0", 0, 0)]
+    [InlineData("S3356.4E15110.5", -33.94, 151.175)]
+    public void Parse_ConvertsDegreesAndMinutesInEveryHemisphere(
+        string position, double expectedLat, double expectedLon)
     {
-        var report = PosReportParser.Parse(ReportWith("PSN", psn));
+        var report = PosReportParser.Parse(WithPart(4, position), ReceivedAt);
         Assert.Equal(expectedLat, report.Latitude, 6);
         Assert.Equal(expectedLon, report.Longitude, 6);
     }
 
     [Fact]
-    public void Parse_ZeroMinutes_IsWholeDegrees()
+    public void Parse_AlsoAcceptsHemisphereLettersAfterTheDigits()
     {
-        var report = PosReportParser.Parse(ReportWith("PSN", "N0000.0 E00000.0"));
-        Assert.Equal(0d, report.Latitude, 6);
-        Assert.Equal(0d, report.Longitude, 6);
+        // The brief's format line reads {lat}{N|S}{lon}{E|W} while its example
+        // puts the letters first. Both are accepted rather than guessing which
+        // one real traffic uses.
+        var report = PosReportParser.Parse(WithPart(4, "1642.3N09612.5E"), ReceivedAt);
+        Assert.Equal(16.705, report.Latitude, 6);
+        Assert.Equal(96.2083, report.Longitude, 6);
+    }
+
+    [Fact]
+    public void Parse_SplitsLatitudeAndLongitudeByDigitCountNotByAnySeparator()
+    {
+        // Two degree digits for latitude, three for longitude. A greedy split
+        // would read "N16" then "42.3E096..." and quietly produce nonsense.
+        var report = PosReportParser.Parse(WithPart(4, "N1642.3E00612.5"), ReceivedAt);
+        Assert.Equal(16.705, report.Latitude, 6);
+        Assert.Equal(6.2083, report.Longitude, 6);
+    }
+
+    [Fact]
+    public void Parse_TakesYearAndMonthFromTheReceiptTimeNotTheMessage()
+    {
+        var received = new DateTimeOffset(2027, 2, 20, 8, 0, 0, TimeSpan.Zero);
+        var report = PosReportParser.Parse(Example, received);
+
+        Assert.Equal(new DateTimeOffset(2027, 2, 4, 12, 5, 0, TimeSpan.Zero), report.Timestamp);
+        Assert.Equal("UL20420270204RGNBKK", report.FlightId);
+    }
+
+    [Fact]
+    public void Parse_DayThatDoesNotExistInTheReceiptMonth_Throws()
+    {
+        // Day 31 with a February receipt time. Building a DateTimeOffset from it
+        // would throw an ArgumentOutOfRangeException from deep inside the BCL;
+        // this turns it into a parse error that says what is actually wrong.
+        var raw = WithPart(3, "311205");
+        var received = new DateTimeOffset(2027, 2, 20, 8, 0, 0, TimeSpan.Zero);
+
+        var ex = Assert.Throws<PosReportParseException>(() => PosReportParser.Parse(raw, received));
+        Assert.Contains("31", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Parse_LowercaseInput_IsNormalisedToUppercase()
+    {
+        var raw = "pos/ul204.fr rgn/to bkk/041205/n1642.3e09612.5/450/12500/2800";
+        var report = PosReportParser.Parse(raw, ReceivedAt);
+
+        Assert.Equal("UL204", report.FlightNumber);
+        Assert.Equal("RGN", report.Departure);
+        Assert.Equal("BKK", report.Destination);
+        Assert.Equal("UL20420260904RGNBKK", report.FlightId);
+    }
+
+    [Fact]
+    public void Parse_SurroundingWhitespace_IsIgnored()
+    {
+        Assert.Equal("UL204", PosReportParser.Parse($"  {Example}\n", ReceivedAt).FlightNumber);
     }
 
     [Theory]
-    [InlineData("FL350", 35000)]
-    [InlineData("FL010", 1000)]
-    [InlineData("2500FT", 2500)]
-    [InlineData("500FT", 500)]
-    public void Parse_AcceptsBothAltitudeForms(string alt, int expectedFeet)
-    {
-        Assert.Equal(expectedFeet, PosReportParser.Parse(ReportWith("ALT", alt)).AltitudeFeet);
-    }
-
-    [Fact]
-    public void Parse_IgnoresUnknownKeys()
-    {
-        var withExtra = ValidReport + "\nSPD/450\nFOB/12.3";
-        Assert.Equal("ABC123", PosReportParser.Parse(withExtra).Callsign);
-    }
-
-    [Fact]
-    public void Parse_IgnoresBlankLines()
-    {
-        var withBlanks = ValidReport.Replace("\n", "\n\n");
-        Assert.Equal("ABC123", PosReportParser.Parse(withBlanks).Callsign);
-    }
-
-    [Fact]
-    public void Parse_AcceptsWindowsLineEndings()
-    {
-        Assert.Equal("ABC123", PosReportParser.Parse(ValidReport.Replace("\n", "\r\n")).Callsign);
-    }
-
-    [Theory]
+    [InlineData("POS/UL204.FR RGN/TO BKK/041205/N1642.3E09612.5/450/12500")]           // too few parts
+    [InlineData("POS/UL204.FR RGN/TO BKK/041205/N1642.3E09612.5/450/12500/2800/99")]   // too many
+    [InlineData("ACK/UL204.FR RGN/TO BKK/041205/N1642.3E09612.5/450/12500/2800")]      // wrong prefix
     [InlineData("")]
     [InlineData("   ")]
-    [InlineData("NOTPOS\nFLT/ABC123")]
-    [InlineData("ACK\nFLT/ABC123")]
-    public void Parse_WrongOrMissingHeader_Throws(string raw)
+    public void Parse_StructurallyWrongMessage_Throws(string raw)
     {
-        var ex = Assert.Throws<PosReportParseException>(() => PosReportParser.Parse(raw));
-        Assert.Contains("POS", ex.Message, StringComparison.OrdinalIgnoreCase);
-    }
-
-    [Fact]
-    public void Parse_HeaderIsCaseInsensitiveAndTrimmed()
-    {
-        var raw = "  pos  \n" + string.Join("\n", ValidReport.Split('\n').Skip(1));
-        Assert.Equal("ABC123", PosReportParser.Parse(raw).Callsign);
+        Assert.Throws<PosReportParseException>(() => PosReportParser.Parse(raw, ReceivedAt));
     }
 
     [Theory]
-    [InlineData("FLT")]
-    [InlineData("DT")]
-    [InlineData("PSN")]
-    [InlineData("ALT")]
-    [InlineData("DEST")]
-    public void Parse_MissingRequiredField_ThrowsNamingTheField(string field)
+    [InlineData(1, "UL204 RGN")]        // missing .FR
+    [InlineData(1, "UL204.FR RANGOON")] // departure not a 3-letter code
+    [InlineData(1, ".FR RGN")]          // no flight number
+    [InlineData(2, "BKK")]              // missing TO
+    [InlineData(2, "TO BANGKOK")]       // destination not a 3-letter code
+    [InlineData(3, "0412")]             // not 6 digits
+    [InlineData(3, "042505")]           // hour 25
+    [InlineData(3, "041265")]           // minute 65
+    [InlineData(4, "N1642.3")]          // longitude missing
+    [InlineData(4, "N1660.0E09612.5")]  // latitude minutes >= 60
+    [InlineData(4, "N1642.3E09660.5")]  // longitude minutes >= 60
+    [InlineData(4, "N9142.3E09612.5")]  // latitude out of range
+    [InlineData(4, "X1642.3E09612.5")]  // bad hemisphere letter
+    [InlineData(4, "nonsense")]
+    [InlineData(5, "fast")]             // ground speed not a number
+    [InlineData(6, "lots")]             // fuel on board not a number
+    [InlineData(6, "-1")]               // negative fuel
+    [InlineData(7, "-1")]               // negative fuel flow
+    public void Parse_MalformedField_Throws(int partIndex, string value)
     {
-        var raw = string.Join("\n",
-            ValidReport.Split('\n').Where(l => !l.TrimStart().StartsWith(field + "/", StringComparison.Ordinal)));
-
-        var ex = Assert.Throws<PosReportParseException>(() => PosReportParser.Parse(raw));
-        Assert.Contains(field, ex.Message, StringComparison.Ordinal);
+        Assert.Throws<PosReportParseException>(
+            () => PosReportParser.Parse(WithPart(partIndex, value), ReceivedAt));
     }
 
     [Theory]
-    [InlineData("N3760.0 W12205.8")]   // latitude minutes >= 60
-    [InlineData("N3722.5 W12260.0")]   // longitude minutes >= 60
-    [InlineData("N9122.5 W12205.8")]   // latitude degrees out of range
-    [InlineData("N3722.5 W18105.8")]   // longitude degrees out of range
-    [InlineData("X3722.5 W12205.8")]   // bad hemisphere letter
-    [InlineData("N3722.5")]            // longitude missing
-    [InlineData("N372 W12205.8")]      // malformed latitude
-    [InlineData("nonsense")]
-    public void Parse_InvalidPosition_Throws(string psn)
+    [InlineData("0")]
+    [InlineData("-450")]
+    public void Parse_NonPositiveGroundSpeed_Throws(string groundSpeed)
     {
-        Assert.Throws<PosReportParseException>(() => PosReportParser.Parse(ReportWith("PSN", psn)));
-    }
-
-    [Theory]
-    [InlineData("FL")]
-    [InlineData("FLABC")]
-    [InlineData("350")]
-    [InlineData("-100FT")]
-    public void Parse_InvalidAltitude_Throws(string alt)
-    {
-        Assert.Throws<PosReportParseException>(() => PosReportParser.Parse(ReportWith("ALT", alt)));
-    }
-
-    [Theory]
-    [InlineData("not-a-date")]
-    [InlineData("2026-13-05T14:20:00Z")]
-    public void Parse_InvalidTimestamp_Throws(string dt)
-    {
-        Assert.Throws<PosReportParseException>(() => PosReportParser.Parse(ReportWith("DT", dt)));
-    }
-
-    [Fact]
-    public void Parse_NonUtcTimestamp_Throws()
-    {
+        // The calculator divides by ground speed. Zero would give an infinite
+        // remaining flight time, so it is rejected here rather than allowed to
+        // become a poison message on the queue.
         var ex = Assert.Throws<PosReportParseException>(
-            () => PosReportParser.Parse(ReportWith("DT", "2026-09-05T14:20:00+07:00")));
-        Assert.Contains("UTC", ex.Message, StringComparison.OrdinalIgnoreCase);
+            () => PosReportParser.Parse(WithPart(5, groundSpeed), ReceivedAt));
+        Assert.Contains("Ground speed", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Parse_ZeroFuel_IsAccepted()
+    {
+        // Zero fuel on board is alarming but it is a legitimate reading, and
+        // the calculator's low-fuel warning is exactly what should surface it.
+        var report = PosReportParser.Parse(WithPart(6, "0"), ReceivedAt);
+        Assert.Equal(0d, report.FuelOnBoardKg);
     }
 
     [Theory]
-    [InlineData("KLA")]
-    [InlineData("KLAXX")]
-    [InlineData("KL4X")]
-    public void Parse_MalformedDestination_Throws(string dest)
+    [InlineData(Example, true)]
+    [InlineData("POS/UL204.FR RGN/TO BKK/041205/N1642.3E09612.5/450/12500", false)]
+    [InlineData("hello", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void IsRoughlyWellFormed_ChecksPrefixAndPartCountOnly(string? raw, bool expected)
     {
-        Assert.Throws<PosReportParseException>(() => PosReportParser.Parse(ReportWith("DEST", dest)));
+        Assert.Equal(expected, PosReportParser.IsRoughlyWellFormed(raw));
     }
 
     [Fact]
-    public void Parse_UnknownButWellFormedDestination_Succeeds()
+    public void IsRoughlyWellFormed_PassesMessagesThatStillFailAFullParse()
     {
-        // Catalog membership is the calculator's problem, not the parser's.
-        Assert.Equal("ZZZZ", PosReportParser.Parse(ReportWith("DEST", "ZZZZ")).DestinationIcao);
+        // The cheap gate is deliberately not the real parser; this documents
+        // that gap rather than leaving someone to discover it.
+        var raw = "POS/nope.FR RGN/TO BKK/041205/N1642.3E09612.5/450/12500/2800";
+        Assert.True(PosReportParser.IsRoughlyWellFormed(raw));
+        Assert.Throws<PosReportParseException>(() => PosReportParser.Parse(raw, ReceivedAt));
     }
 
     [Fact]
-    public void Parse_UppercasesCallsignAndDestination()
+    public void TryParse_ValidMessage_ReturnsTrueWithNoError()
     {
-        var raw = ReportWith("FLT", "abc123").Replace("DEST/KLAX", "DEST/klax");
-        var report = PosReportParser.Parse(raw);
-        Assert.Equal("ABC123", report.Callsign);
-        Assert.Equal("KLAX", report.DestinationIcao);
-    }
-
-    [Fact]
-    public void Parse_DuplicateKey_KeepsTheFirstOccurrence()
-    {
-        var raw = ValidReport + "\nFLT/HIJACKED";
-        Assert.Equal("ABC123", PosReportParser.Parse(raw).Callsign);
-    }
-
-    [Fact]
-    public void TryParse_ValidReport_ReturnsTrueWithNoError()
-    {
-        Assert.True(PosReportParser.TryParse(ValidReport, null, out var report, out var error));
+        Assert.True(PosReportParser.TryParse(Example, ReceivedAt, out var report, out var error));
         Assert.NotNull(report);
         Assert.Null(error);
     }
 
     [Fact]
-    public void TryParse_InvalidReport_ReturnsFalseWithReason()
+    public void TryParse_InvalidMessage_ReturnsFalseWithReason()
     {
-        Assert.False(PosReportParser.TryParse("garbage", null, out var report, out var error));
+        Assert.False(PosReportParser.TryParse("rubbish", ReceivedAt, out var report, out var error));
         Assert.Null(report);
         Assert.False(string.IsNullOrWhiteSpace(error));
     }
 
-    /// <summary>Returns the valid report with one field's value replaced.</summary>
-    private static string ReportWith(string key, string value) =>
-        string.Join("\n", ValidReport.Split('\n')
-            .Select(line => line.TrimStart().StartsWith(key + "/", StringComparison.Ordinal)
-                ? key + "/" + value
-                : line));
+    /// <summary>Returns the example message with one '/'-separated part replaced.</summary>
+    private static string WithPart(int index, string value)
+    {
+        var parts = Example.Split('/');
+        parts[index] = value;
+        return string.Join("/", parts);
+    }
 }

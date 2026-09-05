@@ -1,48 +1,53 @@
-using System.Globalization;
 using System.Net;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.Model;
 using Amazon.Lambda.APIGatewayEvents;
 using Amazon.Lambda.Core;
+using Amazon.S3;
+using PosReportPipeline.Shared.Models;
+using PosReportPipeline.Shared.Parsing;
 
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
 
 namespace PosReportPipeline.StatusApi;
 
 /// <summary>
-/// Serves the latest position and recent track for a flight.
+/// GET /status/{flightId}. Returns the most recent state known for a flight.
 ///
-/// One DynamoDB query answers both.
+/// The results table is checked first, because a calculated result supersedes
+/// the report it came from. If the calculator has not caught up yet the caller
+/// gets the report state instead -- that is the pipeline being asynchronous,
+/// not an error.
 /// </summary>
 public class Function
 {
-    private const int DefaultLimit = 50;
-    private const int MaxLimit = 500;
-
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-    };
-
     private readonly IAmazonDynamoDB _dynamo;
-    private readonly string _tableName;
+    private readonly IAmazonS3 _s3;
+    private readonly string _bucket;
+    private readonly string _reportsTable;
+    private readonly string _resultsTable;
 
     /// <summary>Used by the Lambda runtime.</summary>
     public Function()
         : this(new AmazonDynamoDBClient(),
-               Environment.GetEnvironmentVariable("TABLE_NAME")
-               ?? throw new InvalidOperationException("TABLE_NAME is not set."))
+               new AmazonS3Client(),
+               RequiredEnv("REPORTS_BUCKET"),
+               RequiredEnv("REPORTS_TABLE"),
+               RequiredEnv("RESULTS_TABLE"))
     {
     }
 
     /// <summary>Used by tests.</summary>
-    public Function(IAmazonDynamoDB dynamo, string tableName)
+    public Function(
+        IAmazonDynamoDB dynamo, IAmazonS3 s3,
+        string bucket, string reportsTable, string resultsTable)
     {
         _dynamo = dynamo;
-        _tableName = tableName;
+        _s3 = s3;
+        _bucket = bucket;
+        _reportsTable = reportsTable;
+        _resultsTable = resultsTable;
     }
 
     public async Task<APIGatewayProxyResponse> Handler(
@@ -58,90 +63,102 @@ public class Function
             return Json(HttpStatusCode.BadRequest, new { message = "flightId is required." });
         }
 
-        if (!TryReadLimit(request, out var limit, out var limitError))
+        var latestResult = await LatestItem(_resultsTable, flightId);
+        if (latestResult is not null)
         {
-            return Json(HttpStatusCode.BadRequest, new { message = limitError });
-        }
-
-        var response = await _dynamo.QueryAsync(new QueryRequest
-        {
-            TableName = _tableName,
-            KeyConditionExpression = "flightId = :fid",
-            ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+            var result = await ReadResult(latestResult);
+            if (result is not null)
             {
-                [":fid"] = new() { S = flightId },
-            },
-            // Descending, so Limit keeps the NEWEST reports. Ascending would
-            // silently return the oldest `limit` reports and call the last of
-            // them "latest", which is wrong for any flight longer than `limit`.
-            ScanIndexForward = false,
-            Limit = limit,
-        });
+                return Json(HttpStatusCode.OK, new
+                {
+                    flightId = result.FlightId,
+                    status = "CALCULATED",
+                    timestamp = PosObjectKeys.FormatMilliseconds(result.Timestamp),
+                    remainingFlightTimeMinutes = result.RemainingFlightTimeMinutes,
+                    estimatedFuelAtArrivalKg = result.EstimatedFuelAtArrivalKg,
+                    lowFuelWarning = result.LowFuelWarning,
+                });
+            }
 
-        if (response.Items is null || response.Items.Count == 0)
-        {
-            context.Logger.LogInformation($"No reports for {flightId}.");
-            return Json(HttpStatusCode.NotFound,
-                new { message = $"No reports found for flight '{flightId}'." });
+            // The row exists but its object does not. Fall through to the
+            // report state rather than 500 -- the caller still gets something
+            // true, and the missing object is logged for us to chase.
+            context.Logger.LogError(
+                $"Result row for {flightId} points at an unreadable attachment.");
         }
 
-        // Newest first from DynamoDB; reverse so the track reads chronologically.
-        var track = response.Items.Select(ToDto).Reverse().ToList();
+        var latestReport = await LatestItem(_reportsTable, flightId);
+        if (latestReport is not null)
+        {
+            return Json(HttpStatusCode.OK, new
+            {
+                flightId,
+                status = "PARSED",
+                timestamp = latestReport.TryGetValue("timestamp", out var ts) ? ts.S : null,
+                message = "Report stored; calculation has not completed yet.",
+            });
+        }
 
-        return Json(HttpStatusCode.OK, new
+        context.Logger.LogInformation($"No state found for {flightId}.");
+        return Json(HttpStatusCode.NotFound, new
         {
             flightId,
-            reportCount = track.Count,
-            latest = track[^1],
-            track,
+            message = $"No reports found for flight '{flightId}'.",
         });
     }
 
-    private static bool TryReadLimit(APIGatewayProxyRequest request, out int limit, out string? error)
+    /// <summary>
+    /// Newest item for a flight. Both tables sort by an ISO-8601 UTC timestamp,
+    /// which sorts lexicographically in the same order as chronologically, so
+    /// the last key is the latest report.
+    /// </summary>
+    private async Task<Dictionary<string, AttributeValue>?> LatestItem(string tableName, string flightId)
     {
-        limit = DefaultLimit;
-        error = null;
-
-        if (request.QueryStringParameters is null
-            || !request.QueryStringParameters.TryGetValue("limit", out var raw)
-            || string.IsNullOrWhiteSpace(raw))
+        var response = await _dynamo.QueryAsync(new QueryRequest
         {
-            return true;
-        }
-
-        if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
-            || parsed < 1)
-        {
-            error = "limit must be a positive integer.";
-            return false;
-        }
-
-        limit = Math.Min(parsed, MaxLimit);
-        return true;
-    }
-
-    private static Dictionary<string, object?> ToDto(Dictionary<string, AttributeValue> item)
-    {
-        var dto = new Dictionary<string, object?>();
-
-        foreach (var (name, value) in item)
-        {
-            dto[name] = value switch
+            TableName = tableName,
+            KeyConditionExpression = "flightId = :flightId",
+            ExpressionAttributeValues = new Dictionary<string, AttributeValue>
             {
-                { N: not null } => double.Parse(value.N, CultureInfo.InvariantCulture),
-                { S: not null } => value.S,
-                _ => null,
-            };
+                [":flightId"] = new() { S = flightId },
+            },
+            ScanIndexForward = false,
+            Limit = 1,
+        });
+
+        return response.Items is null || response.Items.Count == 0 ? null : response.Items[0];
+    }
+
+    private async Task<CalculationResult?> ReadResult(Dictionary<string, AttributeValue> row)
+    {
+        if (!row.TryGetValue("attachment", out var attachment) || attachment.S is null)
+        {
+            return null;
         }
 
-        return dto;
+        try
+        {
+            using var response = await _s3.GetObjectAsync(_bucket, attachment.S);
+            using var reader = new StreamReader(response.ResponseStream);
+            var json = await reader.ReadToEndAsync();
+
+            return JsonSerializer.Deserialize<CalculationResult>(json, PosJson.Options);
+        }
+        catch (Exception ex) when (ex is AmazonS3Exception or JsonException)
+        {
+            return null;
+        }
     }
+
+    private static string RequiredEnv(string name) =>
+        Environment.GetEnvironmentVariable(name)
+        ?? throw new InvalidOperationException($"{name} is not set.");
 
     private static APIGatewayProxyResponse Json(HttpStatusCode status, object body) =>
         new()
         {
             StatusCode = (int)status,
             Headers = new Dictionary<string, string> { ["Content-Type"] = "application/json" },
-            Body = JsonSerializer.Serialize(body, JsonOptions),
+            Body = JsonSerializer.Serialize(body),
         };
 }

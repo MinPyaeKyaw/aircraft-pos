@@ -4,86 +4,75 @@ using Xunit;
 namespace PosReportPipeline.Tests;
 
 /// <summary>
-/// Expectations here are analytically exact for a sphere -- a quarter great
-/// circle, a half circle, one degree of arc -- rather than published city-pair
-/// distances, which differ by tens of kilometres between sources and would
-/// make these tests fail for reasons unrelated to the code.
+/// Expectations are derived from the sphere the formula assumes -- a quarter
+/// great circle, a half circle, one degree of arc -- rather than copied from
+/// published city-pair distances, which vary between sources and would make
+/// these tests fail for reasons that have nothing to do with the code.
 /// </summary>
 public class HaversineTests
 {
-    private const double QuarterCircleKm = 10007.557221; // 2*PI*R/4
-    private const double HalfCircleKm = 20015.114442;    // 2*PI*R/2
-    private const double OneDegreeKm = 111.195080;       // 2*PI*R/360
+    private const double QuarterCircleNm = 5403.641466;  // 2*PI*R/4
+    private const double HalfCircleNm = 10807.282932;    // 2*PI*R/2
+    private const double OneDegreeNm = 60.040461;        // 2*PI*R/360
 
     [Fact]
-    public void DistanceKm_IdenticalPoints_IsZero()
+    public void DistanceNm_IdenticalPoints_IsZero()
     {
-        Assert.Equal(0d, Haversine.DistanceKm(37.375, -122.0967, 37.375, -122.0967), 6);
+        Assert.Equal(0d, Haversine.DistanceNm(16.705, 96.2083, 16.705, 96.2083), 9);
     }
 
     [Fact]
-    public void DistanceKm_QuarterWayAroundEquator_IsQuarterCircumference()
+    public void DistanceNm_OneDegreeOfLatitude_IsAboutSixtyNauticalMiles()
     {
-        Assert.Equal(QuarterCircleKm, Haversine.DistanceKm(0, 0, 0, 90), 3);
+        // A nautical mile was defined as one minute of latitude, so one degree
+        // must come out at very close to 60. This is the check that the earth
+        // radius constant is in the right unit at all.
+        var actual = Haversine.DistanceNm(0, 0, 1, 0);
+        Assert.Equal(OneDegreeNm, actual, 4);
+        Assert.InRange(actual, 59.9, 60.1);
     }
 
     [Fact]
-    public void DistanceKm_EquatorToNorthPole_IsQuarterCircumference()
+    public void DistanceNm_QuarterWayAroundEquator_IsQuarterCircumference()
     {
-        Assert.Equal(QuarterCircleKm, Haversine.DistanceKm(0, 0, 90, 0), 3);
+        Assert.Equal(QuarterCircleNm, Haversine.DistanceNm(0, 0, 0, 90), 4);
     }
 
     [Fact]
-    public void DistanceKm_AntipodalOnEquator_IsHalfCircumference()
+    public void DistanceNm_EquatorToNorthPole_IsQuarterCircumference()
     {
-        Assert.Equal(HalfCircleKm, Haversine.DistanceKm(0, 0, 0, 180), 3);
+        Assert.Equal(QuarterCircleNm, Haversine.DistanceNm(0, 0, 90, 0), 4);
     }
 
     [Fact]
-    public void DistanceKm_OneDegreeOfLatitude_IsOneDegreeOfArc()
+    public void DistanceNm_AntipodalOnEquator_IsHalfCircumference()
     {
-        Assert.Equal(OneDegreeKm, Haversine.DistanceKm(0, 0, 1, 0), 3);
+        Assert.Equal(HalfCircleNm, Haversine.DistanceNm(0, 0, 0, 180), 4);
     }
 
     [Fact]
-    public void DistanceKm_IsSymmetric()
+    public void DistanceNm_IsSymmetric()
     {
-        var forward = Haversine.DistanceKm(33.9425, -118.4081, 40.6413, -73.7781);
-        var reverse = Haversine.DistanceKm(40.6413, -73.7781, 33.9425, -118.4081);
+        var forward = Haversine.DistanceNm(16.705, 96.2083, 13.69, 100.7501);
+        var reverse = Haversine.DistanceNm(13.69, 100.7501, 16.705, 96.2083);
         Assert.Equal(forward, reverse, 9);
     }
 
     [Fact]
-    public void DistanceKm_LosAngelesToNewYork_IsAboutThreeThousandNineHundredSeventyKm()
+    public void DistanceNm_WorkedExampleFromTheBrief_IsAboutThreeHundredNineteen()
     {
-        // Sanity check on units only, hence the loose tolerance.
-        var actual = Haversine.DistanceKm(33.9425, -118.4081, 40.6413, -73.7781);
-        Assert.InRange(actual, 3970 * 0.99, 3970 * 1.01);
-    }
-
-    [Theory]
-    [InlineData(1, 0, 0)]      // due north
-    [InlineData(0, 1, 90)]     // due east
-    [InlineData(-1, 0, 180)]   // due south
-    [InlineData(0, -1, 270)]   // due west
-    public void InitialBearingDegrees_CardinalDirectionsFromOrigin(
-        double toLat, double toLon, double expected)
-    {
-        Assert.Equal(expected, Haversine.InitialBearingDegrees(0, 0, toLat, toLon), 6);
+        // The brief's worked example: current position to BKK is "approximately
+        // 319 nautical miles".
+        var actual = Haversine.DistanceNm(16.705, 96.2083, 13.6900, 100.7501);
+        Assert.Equal(319.37, actual, 1);
     }
 
     [Fact]
-    public void InitialBearingDegrees_IsNormalisedToZeroToThreeSixty()
+    public void DistanceNm_HandlesSouthernAndWesternHemispheres()
     {
-        // Heading west-north-west must come back as ~338, never as -22.
-        var bearing = Haversine.InitialBearingDegrees(0, 0, 1, -0.4);
-        Assert.InRange(bearing, 0, 360);
-        Assert.InRange(bearing, 330, 345);
-    }
-
-    [Fact]
-    public void ToNauticalMiles_UsesExactInternationalNauticalMile()
-    {
-        Assert.Equal(1d, Haversine.ToNauticalMiles(1.852), 9);
+        // Sydney to Dubai, both signs exercised, sanity-checked against the
+        // well-known ~6,400 nm figure for that sector.
+        var actual = Haversine.DistanceNm(-33.9399, 151.1753, 25.2532, 55.3657);
+        Assert.InRange(actual, 6200, 6600);
     }
 }

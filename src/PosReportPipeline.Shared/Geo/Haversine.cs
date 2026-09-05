@@ -1,58 +1,29 @@
 namespace PosReportPipeline.Shared.Geo;
 
 /// <summary>
-/// Great-circle distance and bearing on a spherical earth.
+/// Great-circle distance on a spherical earth, in nautical miles.
+///
+/// This is the simplified model the assessment specifies: a sphere, no wind,
+/// no altitude, constant ground speed. Real flight planning uses none of those
+/// assumptions.
 /// </summary>
 public static class Haversine
 {
-    /// <summary>IUGG mean earth radius, in kilometres.</summary>
-    public const double EarthRadiusKm = 6371.0088;
+    public const double EarthRadiusNauticalMiles = 3440.065;
 
-    /// <summary>The international nautical mile, in kilometres. Exact by definition.</summary>
-    public const double KmPerNauticalMile = 1.852;
-
-    /// <summary>Great-circle distance between two points, in kilometres.</summary>
-    public static double DistanceKm(double lat1, double lon1, double lat2, double lon2)
+    public static double DistanceNm(double lat1, double lon1, double lat2, double lon2)
     {
-        var phi1 = ToRadians(lat1);
-        var phi2 = ToRadians(lat2);
-        var deltaPhi = ToRadians(lat2 - lat1);
-        var deltaLambda = ToRadians(lon2 - lon1);
+        var dLat = ToRadians(lat2 - lat1);
+        var dLon = ToRadians(lon2 - lon1);
 
-        var a = Math.Sin(deltaPhi / 2) * Math.Sin(deltaPhi / 2)
-              + Math.Cos(phi1) * Math.Cos(phi2)
-              * Math.Sin(deltaLambda / 2) * Math.Sin(deltaLambda / 2);
+        var a = Math.Sin(dLat / 2) * Math.Sin(dLat / 2)
+              + Math.Cos(ToRadians(lat1)) * Math.Cos(ToRadians(lat2))
+              * Math.Sin(dLon / 2) * Math.Sin(dLon / 2);
 
-        // Clamp guards against a > 1 from floating-point error near antipodes,
-        // which would make Sqrt return NaN.
-        var c = 2 * Math.Asin(Math.Sqrt(Math.Clamp(a, 0d, 1d)));
+        var c = 2 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
 
-        return EarthRadiusKm * c;
+        return EarthRadiusNauticalMiles * c;
     }
 
-    /// <summary>
-    /// Initial great-circle bearing from the first point to the second, in
-    /// degrees clockwise from true north, normalised to [0, 360).
-    /// </summary>
-    public static double InitialBearingDegrees(double lat1, double lon1, double lat2, double lon2)
-    {
-        var phi1 = ToRadians(lat1);
-        var phi2 = ToRadians(lat2);
-        var deltaLambda = ToRadians(lon2 - lon1);
-
-        var y = Math.Sin(deltaLambda) * Math.Cos(phi2);
-        var x = Math.Cos(phi1) * Math.Sin(phi2)
-              - Math.Sin(phi1) * Math.Cos(phi2) * Math.Cos(deltaLambda);
-
-        var bearing = ToDegrees(Math.Atan2(y, x));
-
-        // Atan2 returns (-180, 180]; shift into [0, 360).
-        return (bearing + 360) % 360;
-    }
-
-    public static double ToNauticalMiles(double kilometres) => kilometres / KmPerNauticalMile;
-
-    private static double ToRadians(double degrees) => degrees * Math.PI / 180d;
-
-    private static double ToDegrees(double radians) => radians * 180d / Math.PI;
+    private static double ToRadians(double degrees) => degrees * Math.PI / 180.0;
 }
