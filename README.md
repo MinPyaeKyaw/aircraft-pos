@@ -208,7 +208,8 @@ pos-report-pipeline/
 ├── smoke-test.sh                     # end-to-end check against a deployed stack
 ├── docs/
 │   ├── architecture.png              # diagram
-│   └── architecture.py               # script that generates the diagram
+│   ├── architecture.py               # script that generates the diagram
+│   └── POS-Report-Pipeline.postman_collection.json
 │
 ├── cdk/                              # TypeScript CDK app
 │   ├── bin/
@@ -334,6 +335,24 @@ CI.
   PASS  DLQ stayed empty
 -------------------------------------------
 passed 16, failed 0
+```
+
+### Postman
+
+`docs/POS-Report-Pipeline.postman_collection.json` — import it into Postman
+(File > Import). Twenty-two requests in four folders with 45 assertions: the
+happy path, the low-fuel warning, the unknown-destination permanent failure,
+and every rejection.
+
+Set the `baseUrl` collection variable to your own deployment. Run "Submit
+report" before "Get status" — the POST stores the returned `flightId` in a
+collection variable the GET reads. Use the Collection Runner with a delay of a
+couple of seconds so the pipeline has time to finish.
+
+It also runs headless:
+
+```bash
+npx newman run docs/POS-Report-Pipeline.postman_collection.json --delay-request 2500
 ```
 
 By hand, if you prefer:

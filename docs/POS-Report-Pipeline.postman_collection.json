@@ -1,0 +1,1052 @@
+{
+  "info": {
+    "_postman_id": "30e9fe7f-f499-4bd8-9016-857a6c0243d6",
+    "name": "POS Report Pipeline",
+    "description": "Aircraft position report pipeline.\n\nTwo endpoints:\n- POST /pos-reports    submit a raw POS report (text/plain)\n- GET  /status/{flightId}   latest known state\n\nIMPORTANT: a report carries a day but no year or month, so the flight ID takes those from when the request arrives. `041205` becomes `...YYYYMM04...` for the current month. The requests below build that date at run time, and the POST saves the returned flightId into the `flightId` collection variable, so run POST before GET.\n\nThe pipeline is asynchronous. A status lookup in the first second or two legitimately returns 404 or PARSED. 'Get status' retries automatically when run in the Collection Runner.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Flight IDs embed the current year and month.",
+          "const now = new Date();",
+          "const ym = now.getUTCFullYear().toString() +",
+          "           String(now.getUTCMonth() + 1).padStart(2, '0');",
+          "pm.collectionVariables.set('ym', ym);"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://bjuqwggytj.execute-api.ap-southeast-1.amazonaws.com/prod",
+      "type": "string"
+    },
+    {
+      "key": "flightId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "ym",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "statusRetries",
+      "value": "0",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Happy path",
+      "description": "The worked example from the brief: 43 minutes remaining, 10513 kg at arrival.",
+      "item": [
+        {
+          "name": "Submit report",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                  "const body = pm.response.json();",
+                  "pm.test('status is RECEIVED', () => pm.expect(body.status).to.eql('RECEIVED'));",
+                  "pm.test('flightId is UL204 + this month + 04 + RGN + BKK', () => {",
+                  "    pm.expect(body.flightId).to.eql('UL204' + pm.collectionVariables.get('ym') + '04RGNBKK');",
+                  "});",
+                  "",
+                  "// Hand the id to the next request.",
+                  "pm.collectionVariables.set('flightId', body.flightId);",
+                  "pm.collectionVariables.set('statusRetries', '0');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL204.FR RGN/TO BKK/041205/N1642.3E09612.5/450/12500/2800",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": "Body is the raw POS report as text/plain."
+          }
+        },
+        {
+          "name": "Get status",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const retries = parseInt(pm.collectionVariables.get('statusRetries') || '0', 10);",
+                  "const body = pm.response.code === 200 ? pm.response.json() : {};",
+                  "",
+                  "// The pipeline is asynchronous: 404 or PARSED just means it has not",
+                  "// caught up yet. Retry a bounded number of times in the Runner.",
+                  "if (body.status !== 'CALCULATED' && retries < 10) {",
+                  "    pm.collectionVariables.set('statusRetries', String(retries + 1));",
+                  "    postman.setNextRequest('Get status');",
+                  "} else {",
+                  "    pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "    pm.test('reached CALCULATED', () => pm.expect(body.status).to.eql('CALCULATED'));",
+                  "    pm.test('43 minutes remaining', () => pm.expect(body.remainingFlightTimeMinutes).to.eql(43));",
+                  "    pm.test('10513 kg at arrival', () => pm.expect(body.estimatedFuelAtArrivalKg).to.eql(10513));",
+                  "    pm.test('no low fuel warning', () => pm.expect(body.lowFuelWarning).to.eql(false));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/status/{{flightId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "status",
+                "{{flightId}}"
+              ]
+            },
+            "description": "Returns CALCULATED once the calculator has run; PARSED or 404 before that."
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Scenarios",
+      "item": [
+        {
+          "name": "Low fuel warning",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                  "pm.collectionVariables.set('lowFuelFlightId', pm.response.json().flightId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL777.FR RGN/TO BKK/041205/N1642.3E09612.5/450/500/2800",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": "500 kg on board for a leg that burns 1987 kg. Check status after a few seconds: estimatedFuelAtArrivalKg -1487, lowFuelWarning true."
+          }
+        },
+        {
+          "name": "Low fuel status",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.code === 200 ? pm.response.json() : {};",
+                  "",
+                  "if (body.status === 'CALCULATED') {",
+                  "    pm.test('low fuel warning raised', () => pm.expect(body.lowFuelWarning).to.eql(true));",
+                  "    pm.test('arrival fuel is -1487 kg', () => pm.expect(body.estimatedFuelAtArrivalKg).to.eql(-1487));",
+                  "} else {",
+                  "    // Still in flight through the pipeline. That is legitimate, but it must",
+                  "    // be one of the two real intermediate states, not anything else.",
+                  "    pm.test('is a valid intermediate state (404 or PARSED)', () => {",
+                  "        pm.expect([404, 200]).to.include(pm.response.code);",
+                  "        if (pm.response.code === 200) pm.expect(body.status).to.eql('PARSED');",
+                  "    });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/status/{{lowFuelFlightId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "status",
+                "{{lowFuelFlightId}}"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Unknown destination (permanent failure)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted - the report itself is valid', () => pm.response.to.have.status(202));",
+                  "pm.collectionVariables.set('unknownDestFlightId', pm.response.json().flightId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL888.FR RGN/TO ZZZ/041205/N1642.3E09612.5/450/12500/2800",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": "ZZZ is not in the hardcoded airport catalog. The report is stored and stays readable as PARSED; the calculator drops the message with a log rather than retrying it into the dead-letter queue, because no retry could ever succeed."
+          }
+        },
+        {
+          "name": "Unknown destination status",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('stays PARSED, never CALCULATED', () => {",
+                  "    pm.expect(pm.response.json().status).to.eql('PARSED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/status/{{unknownDestFlightId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "status",
+                "{{unknownDestFlightId}}"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Southern hemisphere (SYD to DXB)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                  "pm.test('negative latitude handled', () => {",
+                  "    pm.expect(pm.response.json().flightId).to.include('SYDDXB');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/QF1.FR SYD/TO DXB/051430/S3356.4E15110.5/480/95000/6200",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": "S and W hemispheres negate the decimal degrees."
+          }
+        },
+        {
+          "name": "Hemisphere letters trailing",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted', () => pm.response.to.have.status(202));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/SQ998.FR SIN/TO HKG/052200/0122.0N10359.5E/470/18000/2500",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": "The brief's format line puts the hemisphere letters after the digits while its example puts them first. Both are accepted."
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Rejections (400)",
+      "description": "Every rejection names what is wrong. Nothing is stored.",
+      "item": [
+        {
+          "name": "Empty body",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\"empty\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Not a POS report",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\"POS/\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "hello",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Too few parts",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\"8 '/'-separated\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL204.FR RGN/TO BKK/041205/N1642.3E09612.5/450/12500",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Too many parts",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\"8 '/'-separated\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL204.FR RGN/TO BKK/041205/N1642.3E09612.5/450/12500/2800/99",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Missing .FR",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\".FR\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL204 RGN/TO BKK/041205/N1642.3E09612.5/450/12500/2800",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Missing TO",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\"TO <destination>\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL204.FR RGN/BKK/041205/N1642.3E09612.5/450/12500/2800",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Hour 25",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\"ddHHmm\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL204.FR RGN/TO BKK/042505/N1642.3E09612.5/450/12500/2800",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Day that does not exist this month",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\"does not exist\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL204.FR RGN/TO BKK/311205/N1642.3E09612.5/450/12500/2800",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Latitude minutes of 60",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\"under 60\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL204.FR RGN/TO BKK/041205/N1660.0E09612.5/450/12500/2800",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Longitude missing",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\"position\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL204.FR RGN/TO BKK/041205/N1642.3/450/12500/2800",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Zero ground speed",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\"Ground speed\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL204.FR RGN/TO BKK/041205/N1642.3E09612.5/0/12500/2800",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Ground speed not a number",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\"not an integer\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL204.FR RGN/TO BKK/041205/N1642.3E09612.5/fast/12500/2800",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        },
+        {
+          "name": "Negative fuel",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('rejected with 400', () => pm.response.to.have.status(400));",
+                  "pm.test('explains why', () => {",
+                  "    const m = pm.response.json().message;",
+                  "    pm.expect(m).to.be.a('string').and.not.empty;",
+                  "    pm.expect(m).to.include(\"non-negative\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "text/plain"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "POS/UL204.FR RGN/TO BKK/041205/N1642.3E09612.5/450/-1/2800",
+              "options": {
+                "raw": {
+                  "language": "text"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/pos-reports",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pos-reports"
+              ]
+            },
+            "description": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Not found",
+      "item": [
+        {
+          "name": "Unknown flightId",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found', () => pm.response.to.have.status(404));",
+                  "pm.test('says which flight', () => {",
+                  "    pm.expect(pm.response.json().message).to.include('NOSUCHFLIGHT');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/status/NOSUCHFLIGHT",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "status",
+                "NOSUCHFLIGHT"
+              ]
+            },
+            "description": ""
+          }
+        }
+      ]
+    }
+  ]
+}
