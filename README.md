@@ -473,17 +473,3 @@ for low fuel. No entry/exit tracing.
 - **No pagination on status.** The brief asks only for the most recent state.
   The tables are keyed to serve a full flight track by `flightId`, so adding it
   later is a query change and no data migration.
-
-## What I would add next
-
-Rough order of value, none of it required by the brief:
-
-- Authentication on both routes, and a WAF or usage plan in front of the API.
-- Alarms on DLQ depth, on Lambda errors, and on `lowFuelWarning` — nothing
-  currently notices when a flight is projected to run dry.
-- A `GET /flights/{flightId}/track` returning the full ordered set of reports;
-  the table already supports it.
-- The airport catalog moved into DynamoDB behind the same interface, so an
-  unknown airport becomes a data fix rather than a deployment.
-- An integration test running against a deployed stack, to cover the wiring the
-  unit tests deliberately do not.
